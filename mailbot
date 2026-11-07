@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""MailForwarderBot - Gmail to Telegram forwarding, webhook mode, Supabase storage."""
+
+import asyncio
+import base64
+import html
+import logging
+import os
+import re
+import secrets
+import time
+from email import message_from_bytes, policy
+from email.mime.text import MIMEText
+from email.utils import parseaddr
+from urllib.parse import urlencode
+
+import aiohttp
+from aiohttp import web
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject
+from aiogram.types import BufferedInputFile, Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
+SB_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SB_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("PUBLIC_BASE_URL", "")).rstrip("/")
+ALLOWED = {int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x}
+POLL = int(os.getenv("POLL_SECONDS", "60"))
+MAX_MB = int(os.getenv("MAX_ATTACH_MB", "10"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or secrets.token_urlsafe(24)
+PORT = int(os.getenv("PORT", "8080"))
+
+SCOPES = ["https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/gmail.send"]
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+USERINFO = "https://openidconnect.googleapis.com/v1/userinfo"
+API = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("mfbot")
+dp = Dispatcher()
+bot: Bot | None = None
+session: aiohttp.ClientSession | None = None
+
+
+# ------------------------------------------------------------------ storage
+
+def sb_headers() -> dict:
+    return {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}",
+            "Content-Type": "application/json", "Prefer": "return=representation"}
+
+
+async def sb(method: str, path: str, **kw):
+    url = f"{SB_URL}/rest/v1/{path}"
+    async with session.request(method, url, headers=sb_headers(), **kw) as r:
+        txt = await r.text()
+        if r.status >= 400:
+            raise RuntimeError(f"supabase {r.status}: {txt[:200]}")
+        return json.loads(txt) if txt else None
+
+
+async def get_accounts(active_only=True) -> list[dict]:
+    q = "accounts?select=*" + ("&active=eq.true" if active_only else "")
+    return await sb("GET", q) or []
+
+
+async def get_account(email: str) -> dict | None:
+    rows = await sb("GET", f"accounts?select=*&email=eq.{email}")
+    return rows[0] if rows else None
+
+
+async def upsert_account(email: str, chat_id: int, refresh_token: str):
+    now = int(time.time())
+    await sb("POST", "accounts?on_conflict=email",
+             json=[{"email": email, "chat_id": chat_id, "refresh_token": refresh_token,
+                    "active": True, "last_ts": now, "last_sync": now}],
+             headers={**sb_headers(), "Prefer": "resolution=merge-duplicates,return=representation"})
+
+
+async def patch_account(email: str, fields: dict):
+    await sb("PATCH", f"accounts?email=eq.{email}", json=fields)
+
+
+async def delete_account(email: str):
+    await sb("DELETE", f"accounts?email=eq.{email}")
+
+
+async def put_state(token: str, chat_id: int, email: str):
+    await sb("POST", "states", json=[{"token": token, "chat_id": chat_id, "email": email}])
+
+
+async def pop_state(token: str) -> dict | None:
+    rows = await sb("GET", f"states?select=*&token=eq.{token}")
+    if not rows:
+        return None
+    await sb("DELETE", f"states?token=eq.{token}")
+    return rows[0]
+
+
+async def seen(mid: str) -> bool:
+    return bool(await sb("GET", f"seen?select=id&id=eq.{mid}"))
+
+
+async def mark_seen(mid: str):
+    try:
+        await sb("POST", "seen", json=[{"id": mid}])
+    except Exception:
+        pass
+
+
+async def prune_seen():
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+    try:
+        await sb("DELETE", f"seen?created=lt.{cutoff}")
+    except Exception:
+        pass
+
+
+def allowed(msg: Message) -> bool:
+    return not ALLOWED or msg.chat.id in ALLOWED
+
+
+def esc(s: str) -> str:
+    return html.escape(s or "")
+
+
+# ----------------------------------------------------------------- commands
+
+@dp.message(Command("start"))
+async def cmd_start(msg: Message):
+    if not allowed(msg):
+        return await msg.answer(f"Not authorized. Chat id: <code>{msg.chat.id}</code>")
+    await msg.answer(
+        "<b>MailForwarderBot</b>\n\n"
+        "/add &lt;email&gt; - consent link for an inbox\n"
+        "/list - connected inboxes\n"
+        "/pause &lt;email&gt; | /resume &lt;email&gt;\n"
+        "/remove &lt;email&gt;\n"
+        "/send &lt;to&gt; | &lt;subject&gt; | &lt;body&gt;"
+    )
+
+
+@dp.message(Command("add"))
+async def cmd_add(msg: Message, command: CommandObject):
+    if not allowed(msg):
+        return
+    addr = (command.args or "").strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", addr):
+        return await msg.answer("Usage: <code>/add someone@gmail.com</code>")
+
+    state = secrets.token_urlsafe(24)
+    await put_state(state, msg.chat.id, addr)
+
+    url = AUTH_URL + "?" + urlencode({
+        "client_id": CLIENT_ID,
+        "redirect_uri": f"{BASE_URL}/oauth/cb",
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "login_hint": addr,
+        "state": state,
+    })
+    await msg.answer(
+        f"Consent link for <b>{esc(addr)}</b> (30 min, single use):\n\n"
+        f"<code>{esc(url)}</code>\n\n"
+        "Send it to whoever owns that inbox. They approve, forwarding starts.",
+        disable_web_page_preview=True)
+
+
+@dp.message(Command("list"))
+async def cmd_list(msg: Message):
+    if not allowed(msg):
+        return
+    mine = [a for a in await get_accounts(active_only=False) if a["chat_id"] == msg.chat.id]
+    if not mine:
+        return await msg.answer("Nothing connected. Use /add.")
+    lines = [f"{'ON' if a['active'] else 'PAUSED'}  <code>{esc(a['email'])}</code>  "
+             f"(last: {int(time.time() - a['last_sync'])}s)" for a in mine]
+    await msg.answer("\n".join(lines))
+
+
+async def _toggle(msg: Message, command: CommandObject, active: bool):
+    if not allowed(msg):
+        return
+    acc = await get_account((command.args or "").strip().lower())
+    if not acc or acc["chat_id"] != msg.chat.id:
+        return await msg.answer("Unknown inbox.")
+    await patch_account(acc["email"], {"active": active})
+    await msg.answer(f"{'Resumed' if active else 'Paused'} <code>{esc(acc['email'])}</code>")
+
+
+@dp.message(Command("pause"))
+async def cmd_pause(msg: Message, command: CommandObject):
+    await _toggle(msg, command, False)
+
+
+@dp.message(Command("resume"))
+async def cmd_resume(msg: Message, command: CommandObject):
+    await _toggle(msg, command, True)
+
+
+@dp.message(Command("remove"))
+async def cmd_remove(msg: Message, command: CommandObject):
+    if not allowed(msg):
+        return
+    acc = await get_account((command.args or "").strip().lower())
+    if not acc or acc["chat_id"] != msg.chat.id:
+        return await msg.answer("Unknown inbox.")
+    await delete_account(acc["email"])
+    await msg.answer(f"Removed <code>{esc(acc['email'])}</code>. Revoke at "
+                     "https://myaccount.google.com/permissions")
+
+
+@dp.message(Command("send"))
+async def cmd_send(msg: Message, command: CommandObject):
+    if not allowed(msg):
+        return
+    raw = (command.args or "").strip()
+    if raw.count("|") < 1:
+        return await msg.answer("Usage: <code>/send to@x.com | Subject | Body</code>")
+    to, _, rest = raw.partition("|")
+    subject, _, body = rest.partition("|")
+    to = parseaddr(to.strip())[1]
+
+    mine = [a for a in await get_accounts() if a["chat_id"] == msg.chat.id]
+    if not mine:
+        return await msg.answer("No active inbox. Use /add.")
+    frm = mine[0]["email"]
+
+    mime = MIMEText(body.strip() or " ", "plain", "utf-8")
+    mime["To"], mime["From"], mime["Subject"] = to, frm, subject.strip() or "(no subject)"
+    raw_msg = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+
+    try:
+        token = await access_token(frm)
+        async with session.post(f"{API}/messages/send", json={"raw": raw_msg},
+                                headers={"Authorization": f"Bearer {token}"}) as r:
+            ok = r.status == 200
+    except Exception as e:
+        return await msg.answer(f"Send failed: {esc(str(e))}")
+    await msg.answer(f"{'Sent' if ok else 'Failed'} to <code>{esc(to)}</code>")
+
+
+# -------------------------------------------------------------------- oauth
+
+async def oauth_cb(request: web.Request) -> web.Response:
+    err, code, state = request.query.get("error"), request.query.get("code"), request.query.get("state")
+    entry = await pop_state(state) if state else None
+
+    if err:
+        return web.Response(text=f"Denied: {err}", content_type="text/html")
+    if not entry:
+        return web.Response(text="Link expired or already used.", content_type="text/html")
+
+    data = {"code": code, "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+            "redirect_uri": f"{BASE_URL}/oauth/cb", "grant_type": "authorization_code"}
+    try:
+        async with session.post(TOKEN_URL, data=data) as r:
+            tok = await r.json()
+        if "refresh_token" not in tok:
+            raise RuntimeError(tok.get("error_description", "no refresh token"))
+        async with session.get(USERINFO, headers={"Authorization": f"Bearer {tok['access_token']}"}) as r:
+            info = await r.json()
+    except Exception as e:
+        log.exception("token exchange")
+        return web.Response(text=f"Exchange failed: {e}", content_type="text/html")
+
+    email = (info.get("email") or entry["email"]).lower()
+    await upsert_account(email, entry["chat_id"], tok["refresh_token"])
+    try:
+        await bot.send_message(entry["chat_id"],
+                               f"Connected <code>{esc(email)}</code>. Mail will be forwarded here.")
+    except Exception:
+        pass
+    return web.Response(text="<h3>Inbox connected.</h3><p>Back to Telegram.</p>",
+                        content_type="text/html")
+
+
+# -------------------------------------------------------------------- gmail
+
+async def access_token(addr: str) -> str:
+    acc = await get_account(addr)
+    data = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+            "refresh_token": acc["refresh_token"], "grant_type": "refresh_token"}
+    async with session.post(TOKEN_URL, data=data) as r:
+        j = await r.json()
+    if "access_token" not in j:
+        raise RuntimeError(j.get("error_description") or "refresh failed")
+    return j["access_token"]
+
+
+def extract(raw: bytes):
+    msg = message_from_bytes(raw, policy=policy.default)
+    body, files = "", []
+    for part in msg.walk():
+        disp = part.get_content_disposition()
+        if disp == "attachment" or part.get_filename():
+            payload = part.get_payload(decode=True) or b""
+            if payload and len(payload) <= MAX_MB * 1024 * 1024:
+                files.append((part.get_filename() or "file.bin", payload))
+        elif part.get_content_type() == "text/plain" and not body:
+            body = (part.get_content() or "").strip()
+        elif part.get_content_type() == "text/html" and not body:
+            body = re.sub(r"<[^>]+>", "", part.get_content() or "").strip()
+    return str(msg.get("From", "?")), str(msg.get("Subject", "(no subject)")), body, files
+
+
+async def forward_account(addr: str, acc: dict, now: int):
+    token = await access_token(addr)
+    headers = {"Authorization": f"Bearer {token}"}
+    async with session.get(f"{API}/messages", headers=headers,
+                           params={"q": f"after:{acc['last_ts']}", "maxResults": 25}) as r:
+        listing = await r.json()
+
+    for ref in listing.get("messages", []):
+        mid = ref["id"]
+        if await seen(mid):
+            continue
+        async with session.get(f"{API}/messages/{mid}", headers=headers, params={"format": "raw"}) as r:
+            if r.status != 200:
+                continue
+            data = (await r.json()).get("raw", "")
+        try:
+            raw = base64.urlsafe_b64decode(data + "===")
+        except Exception:
+            continue
+        sender, subject, body, files = extract(raw)
+
+        await bot.send_message(
+            acc["chat_id"],
+            f"<b>{esc(subject)}</b>\n<b>From:</b> {esc(sender)}\n"
+            f"<b>To:</b> <code>{esc(addr)}</code>\n\n{esc(body[:3000])}",
+            disable_web_page_preview=True)
+        for name, payload in files:
+            await bot.send_document(acc["chat_id"], BufferedInputFile(payload, filename=name))
+        await mark_seen(mid)
+
+    await patch_account(addr, {"last_ts": now, "last_sync": now})
+
+
+async def poller():
+    while True:
+        try:
+            for acc in await get_accounts():
+                try:
+                    await forward_account(acc["email"], acc, int(time.time()))
+                except Exception:
+                    log.exception("forward failed: %s", acc["email"])
+            await prune_seen()
+        except Exception:
+            log.exception("poll cycle")
+        await asyncio.sleep(POLL)
+
+
+# --------------------------------------------------------------------- main
+
+async def health(_request):
+    return web.Response(text="ok")
+
+
+async def main():
+    global bot, session
+    session = aiohttp.ClientSession()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    app = web.Application()
+    app.router.add_get("/health", health)
+    app.router.add_get("/oauth/cb", oauth_cb)
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(
+        app, path=f"/tg/{WEBHOOK_SECRET}")
+    setup_application(app, dp, bot=bot)
+
+    await bot.set_webhook(f"{BASE_URL}/tg/{WEBHOOK_SECRET}",
+                          secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+    asyncio.create_task(poller())
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info("listening on %s", PORT)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
